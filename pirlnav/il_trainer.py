@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 from gym import spaces
 from habitat import Config, logger
@@ -82,6 +83,35 @@ class ILEnvDDPTrainer(PPOTrainer):
         )
         self.actor_critic.to(self.device)
 
+        # if self._is_distributed:
+        #     # Initializes the distributed backend using environment variables
+        #     # set by torchrun. This is the standard, modern method.
+        #     dist.init_process_group(backend="nccl", init_method="env://")
+        #     # Get process-specific info from environment variables
+        #     local_rank = int(os.environ["LOCAL_RANK"])
+        #     world_size = dist.get_world_size()
+        #     rank = dist.get_rank()
+
+        #     # Get the default TCP store for inter-process communication
+        #     tcp_store = torch.distributed.distributed_c10d._get_default_store()
+
+        #     if rank == 0:
+        #         logger.info(f"Initialized DDP with {world_size} workers.")
+
+        #     self.config.defrost()
+        #     self.config.TORCH_GPU_ID = local_rank
+        #     self.config.SIMULATOR_GPU_ID = local_rank
+        #     self.config.TASK_CONFIG.SEED += rank * self.config.NUM_ENVIRONMENTS
+        #     self.config.freeze()
+
+        #     random.seed(self.config.TASK_CONFIG.SEED)
+        #     np.random.seed(self.config.TASK_CONFIG.SEED)
+        #     torch.manual_seed(self.config.TASK_CONFIG.SEED)
+        #     self.num_rollouts_done_store = torch.distributed.PrefixStore(
+        #         "rollout_tracker", tcp_store
+        #     )
+        #     self.num_rollouts_done_store.set("num_done", "0")
+
         self.agent = DDPILAgent(
             actor_critic=self.actor_critic,
             num_envs=self.envs.num_envs,
@@ -92,6 +122,8 @@ class ILEnvDDPTrainer(PPOTrainer):
             max_grad_norm=il_cfg.max_grad_norm,
             wd=il_cfg.wd,
             entropy_coef=il_cfg.entropy_coef,
+            # --- ADDED: Pass the find_unused_params flag from previous fix ---
+            find_unused_params=True,
         )
 
     def _init_train(self):
@@ -101,35 +133,29 @@ class ILEnvDDPTrainer(PPOTrainer):
 
         if self.config.RL.DDPPO.force_distributed:
             self._is_distributed = True
-
-        if is_slurm_batch_job():
-            add_signal_handlers()
-
-        # Add replay sensors
-        self.config.defrost()
-        self.config.TASK_CONFIG.TASK.SENSORS.extend(
-            ["DEMONSTRATION_SENSOR", "INFLECTION_WEIGHT_SENSOR"]
-        )
-        self.config.freeze()
-
+            
+        # --- MOVED: This entire block was moved to the top of the function ---
+        # It MUST run before the agent or environments are created.
         if self._is_distributed:
-            local_rank, tcp_store = init_distrib_slurm(
-                self.config.RL.DDPPO.distrib_backend
-            )
-            if rank0_only():
-                logger.info(
-                    "Initialized DD-PPO with {} workers".format(
-                        torch.distributed.get_world_size()
-                    )
-                )
+            # Initializes the distributed backend using environment variables
+            # set by torchrun. This is the standard, modern method.
+            dist.init_process_group(backend="nccl", init_method="env://")
+
+            # Get process-specific info from environment variables
+            local_rank = int(os.environ["LOCAL_RANK"])
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+
+            # Get the default TCP store for inter-process communication
+            tcp_store = torch.distributed.distributed_c10d._get_default_store()
+
+            if rank == 0:
+                logger.info(f"Initialized DDP with {world_size} workers.")
 
             self.config.defrost()
             self.config.TORCH_GPU_ID = local_rank
             self.config.SIMULATOR_GPU_ID = local_rank
-            # Multiply by the number of simulators to make sure they also get unique seeds
-            self.config.TASK_CONFIG.SEED += (
-                torch.distributed.get_rank() * self.config.NUM_ENVIRONMENTS
-            )
+            self.config.TASK_CONFIG.SEED += rank * self.config.NUM_ENVIRONMENTS
             self.config.freeze()
 
             random.seed(self.config.TASK_CONFIG.SEED)
@@ -139,7 +165,18 @@ class ILEnvDDPTrainer(PPOTrainer):
                 "rollout_tracker", tcp_store
             )
             self.num_rollouts_done_store.set("num_done", "0")
+            
+        if is_slurm_batch_job():
+            add_signal_handlers()
 
+        # Add replay sensors
+        self.config.defrost()
+        self.config.TASK_CONFIG.TASK.SENSORS.extend(
+            ["DEMONSTRATION_SENSOR", "INFLECTION_WEIGHT_SENSOR"]
+        )
+        self.config.freeze()
+        
+        # --- This block was here before, now it's after the DDP init ---
         if rank0_only() and self.config.VERBOSE:
             logger.info(f"config: {self.config}")
 
@@ -174,8 +211,11 @@ class ILEnvDDPTrainer(PPOTrainer):
             os.makedirs(self.config.CHECKPOINT_FOLDER)
 
         self._setup_actor_critic_agent(il_cfg)
-        if self._is_distributed:
-            self.agent.init_distributed(find_unused_params=True)  # type: ignore
+        
+        # --- REMOVED: This line is now redundant because the DDPILAgent's ---
+        # --- own __init__ method calls init_distributed. ---
+        # if self._is_distributed:
+        #     self.agent.init_distributed(find_unused_params=True)  # type: ignore
 
         logger.info(
             "agent number of parameters: {}".format(

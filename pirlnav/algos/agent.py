@@ -6,7 +6,11 @@
 
 from typing import Optional, Tuple
 
+import os
 import torch
+import torch.distributed as dist
+import random
+import numpy as np
 from habitat import logger
 from habitat.utils import profiling_wrapper
 from torch import Tensor
@@ -166,19 +170,13 @@ EPS_PPO = 1e-5
 
 class DecentralizedDistributedMixin:
     def init_distributed(self, find_unused_params: bool = True) -> None:
-        r"""Initializes distributed training for the model
+        # Skip completely if we are not in distributed mode
+        if not torch.distributed.is_initialized():
+            self.reducer = None
+            self.find_unused_params = False
+            return
 
-        1. Broadcasts the model weights from world_rank 0 to all other workers
-        2. Adds gradient hooks to the model
-
-        :param find_unused_params: Whether or not to filter out unused parameters
-                                   before gradient reduction.  This *must* be True if
-                                   there are any parameters in the model that where unused in the
-                                   forward pass, otherwise the gradient reduction
-                                   will not work correctly.
-        """
-        # NB: Used to hide the hooks from the nn.Module,
-        # so they don't show up in the state_dict
+        # ───── distributed path (unchanged) ─────
         class Guard:
             def __init__(self, actor_critic, device):
                 if torch.cuda.is_available():
@@ -190,9 +188,7 @@ class DecentralizedDistributedMixin:
                         actor_critic
                     )
 
-        self._ddp_hooks = Guard(self.actor_critic, self.device)  # type: ignore
-        # self.get_advantages = self._get_advantages_distributed
-
+        self._ddp_hooks = Guard(self.actor_critic, self.device)    # type: ignore
         self.reducer = self._ddp_hooks.ddp.reducer
         self.find_unused_params = find_unused_params
 
@@ -206,4 +202,33 @@ class DecentralizedDistributedMixin:
 
 
 class DDPILAgent(DecentralizedDistributedMixin, ILAgent):
-    pass
+    def __init__(
+        self,
+        actor_critic: nn.Module,
+        num_envs: int,
+        num_mini_batch: int,
+        lr: Optional[float] = None,
+        encoder_lr: Optional[float] = None,
+        eps: Optional[float] = None,
+        max_grad_norm: Optional[float] = None,
+        wd: Optional[float] = None,
+        optimizer: Optional[str] = "AdamW",
+        entropy_coef: Optional[float] = 0.0,
+        find_unused_params: bool = True,
+    ) -> None:
+        # First, initialize the ILAgent part of the class
+        super().__init__(
+            actor_critic=actor_critic,
+            num_envs=num_envs,
+            num_mini_batch=num_mini_batch,
+            lr=lr,
+            encoder_lr=encoder_lr,
+            eps=eps,
+            max_grad_norm=max_grad_norm,
+            wd=wd,
+            optimizer=optimizer,
+            entropy_coef=entropy_coef,
+        )
+
+        # Then, initialize the distributed part of the class
+        self.init_distributed(find_unused_params)
